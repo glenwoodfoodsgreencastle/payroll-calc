@@ -216,6 +216,10 @@ for emp, grp in weeks.groupby("employee"):
         idx = ot_weeks["bonus_hr"].idxmax()
         best_bhr = ot_weeks.loc[idx, "bonus_hr"]
         best_week = ot_weeks.loc[idx, "week_start"]
+    # Days worked = distinct dates in the period where this employee had hours.
+    days_worked = int(period.loc[
+        (period["employee"] == emp) & (period["hours"] > 0), "date"
+    ].nunique())
     emp_rows.append({
         "employee": emp,
         "total": grp["total"].sum(),
@@ -223,19 +227,20 @@ for emp, grp in weeks.groupby("employee"):
         "bonus": grp["bonus"].sum(),
         "best_bhr": best_bhr,
         "best_week": best_week,
+        "days": days_worked,
     })
 summary = pd.DataFrame(emp_rows).sort_values("employee").reset_index(drop=True)
 
 # ---------------------------------------------------------------
-# The payroll table
+# Payroll tables
 #
-# One table, laid out in QuickBooks entry order:
-#   Employee | Regular | Overtime | Sat Bonus | Hourly Rate (input) | OT Rate
+# Upper table (display): what to type into QuickBooks per employee -
+#   Regular, Overtime, Sat Bonus, and the computed OT Rate.
+# Lower table (entry): only overtime employees, one editable Hourly Rate column.
 #
-# Trick for same-table refresh: read this run's pending edits out of the
-# editor's widget state BEFORE building the table, so the OT Rate column is
-# already up to date when the table renders. Tab out of a wage cell and the
-# rate appears on the same row.
+# Trick for same-page refresh: read this run's pending edits out of the
+# lower editor's widget state BEFORE building the upper table, so the OT Rate
+# column is already up to date when the upper table renders.
 # ---------------------------------------------------------------
 st.subheader("Payroll entry")
 
@@ -251,82 +256,86 @@ def show_hours(v):
         return ""
     return fmt_hm(v) if hours_fmt == "H:MM" else "{0:.2f}".format(v)
 
-# Stable row order; key changes whenever the employee set changes so stale
-# row-indexed edits can never land on the wrong person.
-emps = list(summary["employee"])
-editor_key = "payroll_editor_{0}".format(abs(hash(tuple(emps))) % 10**8)
+# Only overtime employees need a wage entered.
+ot_mask = summary["ot"] > 0
+ot_emps = list(summary.loc[ot_mask, "employee"])
+best_bhr_map = dict(zip(summary["employee"], summary["best_bhr"]))
+
+# Key changes when the OT-employee set changes, so stale row-indexed edits
+# can never land on the wrong person after a date-range change.
+entry_key = "wage_entry_{0}".format(abs(hash(tuple(ot_emps))) % 10**8)
 
 # 1. Pull pending edits (this run's keystrokes) into the wages dict first.
-pending = st.session_state.get(editor_key, {}).get("edited_rows", {})
+pending = st.session_state.get(entry_key, {}).get("edited_rows", {})
 for row_idx, changes in pending.items():
     if "Hourly Rate" in changes:
-        emp = emps[int(row_idx)]
+        emp = ot_emps[int(row_idx)]
         val = changes["Hourly Rate"]
         if val is None:
             st.session_state.wages.pop(emp, None)
         else:
             st.session_state.wages[emp] = float(val)
 
-# 2. Build the table with OT Rate already computed from current wages.
-def ot_rate_for(emp, ot, best_bhr):
+# 2. Upper table: totals + computed OT Rate.
+def ot_rate_display(emp, ot):
     if ot <= 0:
         return ""
     w = st.session_state.wages.get(emp)
     if w is None:
-        return "\u26A0 enter rate"
-    return "${0:,.2f}".format((w + best_bhr) * 1.5)
+        return "\u26A0 enter rate below"
+    return "${0:,.2f}".format((w + best_bhr_map[emp]) * 1.5)
 
-table = pd.DataFrame({
-    "Employee": emps,
+display_df = pd.DataFrame({
+    "Employee": summary["employee"].values,
     "Regular": [show_hours(t - o) for t, o in zip(summary["total"], summary["ot"])],
     "Overtime": [show_hours(o) for o in summary["ot"]],
     "Sat Bonus": [("${0:,.2f}".format(b) if b > 0 else "") for b in summary["bonus"]],
-    "Hourly Rate": [
-        st.session_state.wages.get(e) if o > 0 else None
-        for e, o in zip(summary["employee"], summary["ot"])
-    ],
-    "OT Rate": [
-        ot_rate_for(e, o, b)
-        for e, o, b in zip(summary["employee"], summary["ot"], summary["best_bhr"])
-    ],
+    "OT Rate": [ot_rate_display(e, o) for e, o in zip(summary["employee"], summary["ot"])],
+    "Transportation": [(d * 2) if d > 0 else "" for d in summary["days"]],
 })
 
-st.data_editor(
-    table,
+st.dataframe(
+    display_df,
     hide_index=True,
-    disabled=["Employee", "Regular", "Overtime", "Sat Bonus", "OT Rate"],
-    column_config={
-        "Regular": st.column_config.TextColumn("Regular", width="small"),
-        "Overtime": st.column_config.TextColumn("Overtime", width="small"),
-        "Sat Bonus": st.column_config.TextColumn("Sat Bonus", width="small"),
-        "Hourly Rate": st.column_config.NumberColumn(
-            "Hourly Rate ($/hr)",
-            help="Only needed where OT Rate says 'enter rate'.",
-            min_value=0.0, step=0.25, format="$%.2f", width="small",
-        ),
-        "OT Rate": st.column_config.TextColumn(
-            "OT Rate ($/hr)",
-            help="(hourly rate + highest Bonus/Hr among OT weeks) x 1.5",
-            width="small",
-        ),
-    },
-    key=editor_key,
     use_container_width=True,
-    height=min(38 * (len(table) + 1) + 4, 900),
+    height=min(38 * (len(display_df) + 1) + 4, 700),
 )
+st.caption("OT Rate = (hourly rate + highest Bonus/Hr among overtime weeks) x 1.5")
 
-n_ot = int((summary["ot"] > 0).sum())
-n_done = sum(1 for e, o in zip(summary["employee"], summary["ot"])
-             if o > 0 and e in st.session_state.wages)
-if n_ot == 0:
-    st.success("No employee has overtime in this period.")
-elif n_done < n_ot:
-    st.warning("{0} of {1} overtime employees still need an hourly rate "
-               "(rows showing \u26A0 enter rate).".format(n_ot - n_done, n_ot))
+# 3. Lower table: wage entry for overtime employees only.
+if not ot_emps:
+    st.success("No employee has overtime in this period - no rates to enter.")
 else:
-    st.success("All {0} overtime employees have rates entered.".format(n_ot))
-st.caption("Type a rate and press Tab or Enter - the OT Rate fills in on the same row. "
-           "OT Rate = (hourly rate + highest Bonus/Hr among overtime weeks) x 1.5")
+    st.markdown("**Enter hourly rate for overtime employees**")
+
+    entry_df = pd.DataFrame({
+        "Employee": ot_emps,
+        "Hourly Rate": [st.session_state.wages.get(e) for e in ot_emps],
+    })
+
+    st.data_editor(
+        entry_df,
+        hide_index=True,
+        disabled=["Employee"],
+        column_config={
+            "Hourly Rate": st.column_config.NumberColumn(
+                "Hourly Rate ($/hr)",
+                min_value=0.0, step=0.25, format="$%.2f",
+            ),
+        },
+        key=entry_key,
+        use_container_width=True,
+        height=min(38 * (len(entry_df) + 1) + 4, 500),
+    )
+
+    n_done = sum(1 for e in ot_emps if e in st.session_state.wages)
+    n_ot = len(ot_emps)
+    if n_done < n_ot:
+        st.warning("{0} of {1} employees still need an hourly rate.".format(
+            n_ot - n_done, n_ot))
+    else:
+        st.success("All {0} rates entered - OT Rates are ready in the table above.".format(n_ot))
+    st.caption("Type a rate and press Tab or Enter - the OT Rate updates in the table above.")
 
 # ---------------------------------------------------------------
 # Excel export
@@ -347,6 +356,7 @@ export = pd.DataFrame({
         round((wage_map[e] + b) * 1.5, 4) if (e in wage_map and o > 0) else None
         for e, b, o in zip(summary["employee"], summary["best_bhr"], summary["ot"])
     ],
+    "Transportation": (summary["days"] * 2).values,
 })
 
 buf = io.BytesIO()
