@@ -216,10 +216,6 @@ for emp, grp in weeks.groupby("employee"):
         idx = ot_weeks["bonus_hr"].idxmax()
         best_bhr = ot_weeks.loc[idx, "bonus_hr"]
         best_week = ot_weeks.loc[idx, "week_start"]
-    # Days worked = distinct dates in the period where this employee had hours.
-    days_worked = int(period.loc[
-        (period["employee"] == emp) & (period["hours"] > 0), "date"
-    ].nunique())
     emp_rows.append({
         "employee": emp,
         "total": grp["total"].sum(),
@@ -227,7 +223,6 @@ for emp, grp in weeks.groupby("employee"):
         "bonus": grp["bonus"].sum(),
         "best_bhr": best_bhr,
         "best_week": best_week,
-        "days": days_worked,
     })
 summary = pd.DataFrame(emp_rows).sort_values("employee").reset_index(drop=True)
 
@@ -291,7 +286,6 @@ display_df = pd.DataFrame({
     "Overtime": [show_hours(o) for o in summary["ot"]],
     "Sat Bonus": [("${0:,.2f}".format(b) if b > 0 else "") for b in summary["bonus"]],
     "OT Rate": [ot_rate_display(e, o) for e, o in zip(summary["employee"], summary["ot"])],
-    "Transportation": [(d * 2) if d > 0 else "" for d in summary["days"]],
 })
 
 st.dataframe(
@@ -356,7 +350,6 @@ export = pd.DataFrame({
         round((wage_map[e] + b) * 1.5, 4) if (e in wage_map and o > 0) else None
         for e, b, o in zip(summary["employee"], summary["best_bhr"], summary["ot"])
     ],
-    "Transportation": (summary["days"] * 2).values,
 })
 
 buf = io.BytesIO()
