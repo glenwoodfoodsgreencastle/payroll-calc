@@ -227,81 +227,106 @@ for emp, grp in weeks.groupby("employee"):
 summary = pd.DataFrame(emp_rows).sort_values("employee").reset_index(drop=True)
 
 # ---------------------------------------------------------------
-# One-table view: enter wages, see OT rates
+# The payroll table
+#
+# One table, laid out in QuickBooks entry order:
+#   Employee | Regular | Overtime | Sat Bonus | Hourly Rate (input) | OT Rate
+#
+# Trick for same-table refresh: read this run's pending edits out of the
+# editor's widget state BEFORE building the table, so the OT Rate column is
+# already up to date when the table renders. Tab out of a wage cell and the
+# rate appears on the same row.
 # ---------------------------------------------------------------
-st.subheader("Employees")
+st.subheader("Payroll entry")
 
 if "wages" not in st.session_state:
     st.session_state.wages = {}
 
-# Build the editor table. Employees with overtime get a red flag in the name
-# column so it's obvious which rows need a wage.
-def _label(emp, has_ot):
-    return ("\u26A0 " + emp) if has_ot else emp   # warning sign for OT
+with st.sidebar:
+    st.markdown("---")
+    hours_fmt = st.radio("Show hours as", ["H:MM", "Decimal"], horizontal=True)
 
-editor_in = pd.DataFrame({
-    "Employee": [_label(r["employee"], r["ot"] > 0) for _, r in summary.iterrows()],
-    "Regular": [fmt_hm(v) for v in summary["total"] - summary["ot"]],
-    "Overtime": [fmt_hm(v) if v > 0 else "-" for v in summary["ot"]],
-    "Sat Bonus": ["${0:,.2f}".format(v) for v in summary["bonus"]],
+def show_hours(v):
+    if v <= 0:
+        return ""
+    return fmt_hm(v) if hours_fmt == "H:MM" else "{0:.2f}".format(v)
+
+# Stable row order; key changes whenever the employee set changes so stale
+# row-indexed edits can never land on the wrong person.
+emps = list(summary["employee"])
+editor_key = "payroll_editor_{0}".format(abs(hash(tuple(emps))) % 10**8)
+
+# 1. Pull pending edits (this run's keystrokes) into the wages dict first.
+pending = st.session_state.get(editor_key, {}).get("edited_rows", {})
+for row_idx, changes in pending.items():
+    if "Hourly Rate" in changes:
+        emp = emps[int(row_idx)]
+        val = changes["Hourly Rate"]
+        if val is None:
+            st.session_state.wages.pop(emp, None)
+        else:
+            st.session_state.wages[emp] = float(val)
+
+# 2. Build the table with OT Rate already computed from current wages.
+def ot_rate_for(emp, ot, best_bhr):
+    if ot <= 0:
+        return ""
+    w = st.session_state.wages.get(emp)
+    if w is None:
+        return "\u26A0 enter rate"
+    return "${0:,.2f}".format((w + best_bhr) * 1.5)
+
+table = pd.DataFrame({
+    "Employee": emps,
+    "Regular": [show_hours(t - o) for t, o in zip(summary["total"], summary["ot"])],
+    "Overtime": [show_hours(o) for o in summary["ot"]],
+    "Sat Bonus": [("${0:,.2f}".format(b) if b > 0 else "") for b in summary["bonus"]],
     "Hourly Rate": [
         st.session_state.wages.get(e) if o > 0 else None
         for e, o in zip(summary["employee"], summary["ot"])
     ],
-    "OT Rate": [""] * len(summary),
+    "OT Rate": [
+        ot_rate_for(e, o, b)
+        for e, o, b in zip(summary["employee"], summary["ot"], summary["best_bhr"])
+    ],
 })
 
-edited = st.data_editor(
-    editor_in,
+st.data_editor(
+    table,
     hide_index=True,
     disabled=["Employee", "Regular", "Overtime", "Sat Bonus", "OT Rate"],
     column_config={
+        "Regular": st.column_config.TextColumn("Regular", width="small"),
+        "Overtime": st.column_config.TextColumn("Overtime", width="small"),
+        "Sat Bonus": st.column_config.TextColumn("Sat Bonus", width="small"),
         "Hourly Rate": st.column_config.NumberColumn(
             "Hourly Rate ($/hr)",
-            help="Enter for employees marked with the warning sign.",
-            min_value=0.0, step=0.25, format="$%.2f",
+            help="Only needed where OT Rate says 'enter rate'.",
+            min_value=0.0, step=0.25, format="$%.2f", width="small",
         ),
         "OT Rate": st.column_config.TextColumn(
             "OT Rate ($/hr)",
             help="(hourly rate + highest Bonus/Hr among OT weeks) x 1.5",
+            width="small",
         ),
     },
-    key="main_editor",
+    key=editor_key,
     use_container_width=True,
+    height=min(38 * (len(table) + 1) + 4, 900),
 )
 
-# Persist wages + compute OT rates, then re-display the OT Rate column filled in.
-ot_rate_lookup = {}
-for i, r in summary.iterrows():
-    emp = r["employee"]
-    wage_in = edited.iloc[i]["Hourly Rate"]
-    if r["ot"] > 0 and pd.notna(wage_in):
-        st.session_state.wages[emp] = float(wage_in)
-        rate = (float(wage_in) + r["best_bhr"]) * 1.5
-        ot_rate_lookup[emp] = rate
-
-# Show a second, read-only table with the computed OT rates for overtime employees.
-ot_only = summary[summary["ot"] > 0]
-if not ot_only.empty:
-    st.markdown("**Overtime rates**")
-    ot_view = pd.DataFrame({
-        "Employee": ot_only["employee"].values,
-        "Hourly Rate": [
-            "${0:,.2f}".format(st.session_state.wages[e])
-            if e in st.session_state.wages else "enter above"
-            for e in ot_only["employee"]
-        ],
-        "OT Rate": [
-            "${0:,.2f}".format(ot_rate_lookup[e])
-            if e in ot_rate_lookup else "-"
-            for e in ot_only["employee"]
-        ],
-    })
-    st.dataframe(ot_view, hide_index=True, use_container_width=True)
-    st.caption("\u26A0 marks employees with overtime. "
-               "OT Rate = (hourly rate + highest Bonus/Hr among OT weeks) x 1.5")
-else:
+n_ot = int((summary["ot"] > 0).sum())
+n_done = sum(1 for e, o in zip(summary["employee"], summary["ot"])
+             if o > 0 and e in st.session_state.wages)
+if n_ot == 0:
     st.success("No employee has overtime in this period.")
+elif n_done < n_ot:
+    st.warning("{0} of {1} overtime employees still need an hourly rate "
+               "(rows showing \u26A0 enter rate).".format(n_ot - n_done, n_ot))
+else:
+    st.success("All {0} overtime employees have rates entered.".format(n_ot))
+st.caption("Type a rate and press Tab or Enter - the OT Rate fills in on the same row. "
+           "OT Rate = (hourly rate + highest Bonus/Hr among overtime weeks) x 1.5")
 
 # ---------------------------------------------------------------
 # Excel export
