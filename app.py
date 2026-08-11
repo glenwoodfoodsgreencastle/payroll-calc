@@ -227,121 +227,106 @@ for emp, grp in weeks.groupby("employee"):
 summary = pd.DataFrame(emp_rows).sort_values("employee").reset_index(drop=True)
 
 # ---------------------------------------------------------------
-# Wage entry for overtime employees  (the dynamic part)
+# One-table view: enter wages, see OT rates
 # ---------------------------------------------------------------
-ot_emps = summary[summary["ot"] > 0].copy()
+st.subheader("Employees")
 
-st.subheader("Overtime employees - enter base hourly wage")
-if ot_emps.empty:
-    st.success("No employee has overtime in this period.")
-else:
-    if "wages" not in st.session_state:
-        st.session_state.wages = {}
+if "wages" not in st.session_state:
+    st.session_state.wages = {}
 
-    editor_in = pd.DataFrame({
-        "Employee": ot_emps["employee"].values,
-        "OT Hours": [fmt_hm(h) for h in ot_emps["ot"]],
-        "Highest Bonus/Hr": ot_emps["best_bhr"].round(4).values,
-        "Base Wage": [st.session_state.wages.get(e) for e in ot_emps["employee"]],
+# Build the editor table. Employees with overtime get a red flag in the name
+# column so it's obvious which rows need a wage.
+def _label(emp, has_ot):
+    return ("\u26A0 " + emp) if has_ot else emp   # warning sign for OT
+
+editor_in = pd.DataFrame({
+    "Employee": [_label(r["employee"], r["ot"] > 0) for _, r in summary.iterrows()],
+    "Regular": [fmt_hm(v) for v in summary["total"] - summary["ot"]],
+    "Overtime": [fmt_hm(v) if v > 0 else "-" for v in summary["ot"]],
+    "Sat Bonus": ["${0:,.2f}".format(v) for v in summary["bonus"]],
+    "Hourly Rate": [
+        st.session_state.wages.get(e) if o > 0 else None
+        for e, o in zip(summary["employee"], summary["ot"])
+    ],
+    "OT Rate": [""] * len(summary),
+})
+
+edited = st.data_editor(
+    editor_in,
+    hide_index=True,
+    disabled=["Employee", "Regular", "Overtime", "Sat Bonus", "OT Rate"],
+    column_config={
+        "Hourly Rate": st.column_config.NumberColumn(
+            "Hourly Rate ($/hr)",
+            help="Enter for employees marked with the warning sign.",
+            min_value=0.0, step=0.25, format="$%.2f",
+        ),
+        "OT Rate": st.column_config.TextColumn(
+            "OT Rate ($/hr)",
+            help="(hourly rate + highest Bonus/Hr among OT weeks) x 1.5",
+        ),
+    },
+    key="main_editor",
+    use_container_width=True,
+)
+
+# Persist wages + compute OT rates, then re-display the OT Rate column filled in.
+ot_rate_lookup = {}
+for i, r in summary.iterrows():
+    emp = r["employee"]
+    wage_in = edited.iloc[i]["Hourly Rate"]
+    if r["ot"] > 0 and pd.notna(wage_in):
+        st.session_state.wages[emp] = float(wage_in)
+        rate = (float(wage_in) + r["best_bhr"]) * 1.5
+        ot_rate_lookup[emp] = rate
+
+# Show a second, read-only table with the computed OT rates for overtime employees.
+ot_only = summary[summary["ot"] > 0]
+if not ot_only.empty:
+    st.markdown("**Overtime rates**")
+    ot_view = pd.DataFrame({
+        "Employee": ot_only["employee"].values,
+        "Hourly Rate": [
+            "${0:,.2f}".format(st.session_state.wages[e])
+            if e in st.session_state.wages else "enter above"
+            for e in ot_only["employee"]
+        ],
+        "OT Rate": [
+            "${0:,.2f}".format(ot_rate_lookup[e])
+            if e in ot_rate_lookup else "-"
+            for e in ot_only["employee"]
+        ],
     })
-    edited = st.data_editor(
-        editor_in,
-        hide_index=True,
-        disabled=["Employee", "OT Hours", "Highest Bonus/Hr"],
-        column_config={
-            "Base Wage": st.column_config.NumberColumn("Base Wage ($/hr)",
-                                                       min_value=0.0, step=0.25,
-                                                       format="$%.2f"),
-            "Highest Bonus/Hr": st.column_config.NumberColumn(format="$%.4f"),
-        },
-        key="wage_editor",
-    )
-
-    # persist wages + compute OT rates
-    results = []
-    for _, r in edited.iterrows():
-        w = r["Base Wage"]
-        if pd.notna(w):
-            st.session_state.wages[r["Employee"]] = float(w)
-        bhr = float(r["Highest Bonus/Hr"])
-        ot_rate = (float(w) + bhr) * 1.5 if pd.notna(w) else None
-        results.append({"Employee": r["Employee"],
-                        "Base Wage": w,
-                        "Bonus/Hr Used": bhr,
-                        "OT Rate": ot_rate})
-    res_df = pd.DataFrame(results)
-
-    st.subheader("Overtime rates")
-    show = res_df.copy()
-    show["Base Wage"] = show["Base Wage"].map(lambda v: "${0:,.2f}".format(v) if pd.notna(v) else "-")
-    show["Bonus/Hr Used"] = show["Bonus/Hr Used"].map(lambda v: "${0:,.4f}".format(v))
-    show["OT Rate"] = show["OT Rate"].map(lambda v: "${0:,.2f}".format(v) if v is not None else "enter wage")
-    st.dataframe(show, hide_index=True, use_container_width=True)
-    st.caption("OT Rate = (base wage + highest Bonus/Hr among overtime weeks) x 1.5")
-
-# ---------------------------------------------------------------
-# Week-by-week detail
-# ---------------------------------------------------------------
-st.subheader("Week-by-week detail")
-best_lookup = {r["employee"]: r["best_week"] for _, r in summary.iterrows()}
-
-for emp in summary["employee"]:
-    grp = weeks[weeks["employee"] == emp].sort_values("week_start")
-    label = "{0}  -  {1} total".format(emp, fmt_hm(grp["total"].sum()))
-    if (grp["ot"] > 0).any():
-        label += "  -  OT " + fmt_hm(grp["ot"].sum())
-    with st.expander(label):
-        det = pd.DataFrame({
-            "Week": [
-                "{0}{1} - {2}".format(
-                    "* " if (best_lookup.get(emp) == ws and (grp[grp["week_start"] == ws]["ot"] > 0).any()) else "",
-                    ws.strftime("%b %d"),
-                    (ws + timedelta(days=6)).strftime("%b %d"))
-                for ws in grp["week_start"]],
-            "Total": [fmt_hm(v) for v in grp["total"]],
-            "Regular": [fmt_hm(v) for v in grp["reg"]],
-            "Overtime": [fmt_hm(v) for v in grp["ot"]],
-            "Sat Bonus": ["${0:,.2f}".format(v) for v in grp["bonus"]],
-            "Bonus/Hr": ["${0:,.4f}".format(v) if v > 0 else "-" for v in grp["bonus_hr"]],
-            "OT + Sat": ["YES" if f else "" for f in grp["flag"]],
-        })
-
-        def _highlight(row):
-            style = "color: #cc0000; font-weight: 600" if row["OT + Sat"] == "YES" else ""
-            return [style] * len(row)
-
-        st.dataframe(det.style.apply(_highlight, axis=1), hide_index=True,
-                     use_container_width=True)
-st.caption("* marks the week whose Bonus/Hr sets the overtime rate. "
-           "Red rows have both overtime and a qualifying Saturday.")
+    st.dataframe(ot_view, hide_index=True, use_container_width=True)
+    st.caption("\u26A0 marks employees with overtime. "
+               "OT Rate = (hourly rate + highest Bonus/Hr among OT weeks) x 1.5")
+else:
+    st.success("No employee has overtime in this period.")
 
 # ---------------------------------------------------------------
 # Excel export
 # ---------------------------------------------------------------
 st.subheader("Export")
 
-sum_out = summary.copy()
-sum_out["best_week"] = sum_out["best_week"].map(lambda v: str(v) if v is not None else "")
-sum_out.columns = ["Employee", "Total Hours", "OT Hours", "Sat Bonus $",
-                   "Highest Bonus/Hr", "Week Used"]
-if not ot_emps.empty:
-    wage_map = st.session_state.get("wages", {})
-    sum_out["Base Wage"] = sum_out["Employee"].map(lambda e: wage_map.get(e))
-    sum_out["OT Rate"] = [
-        (wage_map[e] + b) * 1.5 if (e in wage_map and o > 0) else None
-        for e, b, o in zip(sum_out["Employee"], sum_out["Highest Bonus/Hr"],
-                           sum_out["OT Hours"])]
-
-wk_out = weeks.copy().sort_values(["employee", "week_start"])
-wk_out["week_start"] = wk_out["week_start"].map(str)
-wk_out.columns = ["Employee", "Week Starting", "Total Hours", "Regular Hours",
-                  "OT Hours", "Qualifying Saturdays", "Sat Bonus $", "Bonus/Hr",
-                  "OT + Sat Week"]
+wage_map = st.session_state.get("wages", {})
+export = pd.DataFrame({
+    "Employee": summary["employee"].values,
+    "Regular Hours": (summary["total"] - summary["ot"]).round(4).values,
+    "Overtime Hours": summary["ot"].round(4).values,
+    "Saturday Bonus $": summary["bonus"].round(2).values,
+    "Hourly Rate": [
+        wage_map.get(e) if o > 0 else None
+        for e, o in zip(summary["employee"], summary["ot"])
+    ],
+    "OT Rate": [
+        round((wage_map[e] + b) * 1.5, 4) if (e in wage_map and o > 0) else None
+        for e, b, o in zip(summary["employee"], summary["best_bhr"], summary["ot"])
+    ],
+})
 
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-    sum_out.to_excel(xw, sheet_name="Summary", index=False)
-    wk_out.to_excel(xw, sheet_name="Weekly Detail", index=False)
+    export.to_excel(xw, sheet_name="OT Report", index=False)
 
 st.download_button(
     "Download Excel report",
